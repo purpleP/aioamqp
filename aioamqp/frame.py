@@ -54,6 +54,7 @@ from .properties import Properties
 DUMP_FRAMES = False
 
 
+
 class AmqpEncoder:
 
     def __init__(self, writer=None):
@@ -203,6 +204,7 @@ class AmqpEncoder:
         self.payload.seek(start)                    # move before the flag
         self.write_short(properties_flag_value)     # set the flag
         self.payload.seek(0, os.SEEK_END)
+
 
 
 class AmqpDecoder:

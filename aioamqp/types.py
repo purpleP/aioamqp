@@ -1,266 +1,226 @@
-from itertools import takewhile
+from itertools import takewhile, chain
 from enum import IntEnum
 from operator import concat
 import aioamqp
 from collections import namedtuple
 from functools import reduce, singledispatch, partial
 import struct
-from decimal import Decimal as bDecimal
+from decimal import Decimal as Decimal
 import io
 from more_functools import nwise_iter
 
-from aioamqp.helpers import typed_namedtuple
 from aioamqp.properties import Properties
 
 
-class AmqpType:
-    @classmethod
-    def read(cls, reader):
-        raise NotImplementedError()
-
-    @classmethod
-    def write(cls, value, stream):
-        raise NotImplementedError()
+SimpleType = namedtuple('SimpleType', 'format size')
+ProcessedType = namedtuple('ProcessedType', 'types packer unpacker')
+Nothing = namedtuple('Nothing', '')
+Container = namedtuple('Container', 'py_type item_encoder iter_items item_reader')
+StringType = namedtuple('StringType', 'length_type')
 
 
-class Primitive(AmqpType):
-    format = None
-    size = None
-    @classmethod
-    def read(cls, reader):
-        return struct.unpack(cls.format, reader.read(cls.size))[0]
-
-    @classmethod
-    def write(cls, value, stream):
-        stream.write(struct.pack(cls.format, value))
+def signed_unsigned_pair(format, size):
+    return SimpleType('!' + format, size), SimpleType('!' + format.upper(), size)
 
 
-class Char(Primitive):
-    format = '!c'
-    size = 1
+def bits(byte):
+    return ((byte & 1 << i) != 0 for i in range(8)),
 
 
-class Bool(AmqpType):
-    @classmethod
-    def read(cls, reader):
-        return bool(Char.read(reader))
-    
-    @classmethod
-    def write(cls, stream, bits):
-        assert len(bits) <= 8
-        padding = (False,) * 8 - len(bits)
-        Char.write(stream, int.from_bytes(padding + bits))
+def to_byte(bit):
+    padding = (False, ) * 8 - len(bits)
+    return encode(CHAR, int.from_bytes(padding + bits, 'big')),
 
 
-class UnsignedChar(Char):
-    format = '!B'
+def pack_decimal(value):
+    normalized = value.normalize()
+    if normalized.as_tuple().exponent < 0:
+        decimals = - value.as_tuple().exponent
+        raw = int(value * (bDecimal(10) ** decimals))
+    else:
+        decimals = 0
+        raw = int(normalized)
+    return decimals, raw
 
 
-class SignedChar(Char):
-    format = '!b'
+def unpack_decimal(decimals, raw):
+    return Decimal(raw) * (Decimal(10) ** -decimals)
 
 
-class Short(Primitive):
-    format = '!H'
-    size = 2
+CHAR = SimpleType('!c', 1)
+SIGNED_CHAR, UNSIGNED_CHAR = signed_unsigned_pair('b', 1)
+SIGNED_SHORT, SHORT = signed_unsigned_pair('h', 2)
+SIGNED_LONG, LONG = signed_unsigned_pair('i', 4)
+SIGNED_LONGLONG, LONGLONG = signed_unsigned_pair('q', 8)
+FLOAT = SimpleType('!f', 4)
+DOUBLE = SimpleType('!d', 8)
+TIMESTAMP = LONGLONG
+NOTHING = Nothing
+PACKED_BOOLS = ProcessedType((CHAR,), bits, to_byte)
+DECIMAL = ProcessedType((UNSIGNED_CHAR, SIGNED_LONG), pack_decimal, unpack_decimal)
+SHORTSTR, LONGSTR = StringType(UNSIGNED_CHAR), StringType(LONG)
+ARRAY = Container(tuple, encode_typed, lambda x: x, read_typed)
+TABLE = Container(dict, encode_key_value, lambda x: x.items(), read_key_value)
 
 
-class SignedShort(Short):
-    format = '!h'
+@singledispatch
+def read(as_type, stream):
+    raise TypeError('Can not read from stream as type {}'.format(as_type))
 
 
-class Long(Primitive):
-    format = '!I'
-    size = 4
+@singledispatch
+def write(as_type, stream, value):
+    stream.write(encode(as_type, value))
 
 
-class SignedLong(Long):
-    format = '!i'
+@singledispatch
+def encode(as_type, value):
+    return value
 
 
-class LongLong(Primitive):
-    format = '!Q'
-    size = 8
+@singledispatch
+def decode(as_type, buffer):
+    return buffer
 
 
-class SignedLongLong(LongLong):
-    format = '!q'
+@encode.register(Nothing)
+def encode_nothing(as_type, value):
+    return b''
 
-
-class UnsignedLongLong(Primitive):
+@decode.register(Nothing)
+def decode_nothing(as_type, buffer):
     pass
 
 
-class Float(Primitive):
-    format = '!f'
-    size = 4
+@read.register(SimpleType)
+def read_simple_type(as_type, stream):
+    return decode_simple_type(as_type, stream.read(as_type.size))
 
 
-class Double(Primitive):
-    format = '!d'
-    size = 8
+@write.register(SimpleType)
+def write_simple_type(as_type, stream, value):
+    stream.write(encode_simple_type(as_type, value))
 
 
-class BaseStr(AmqpType):
-    len_type = None
-    @classmethod
-    def read(cls, reader):
-        length = cls.len_type.read(reader)
-        return reader.read(length).decode()
-
-    @staticmethod
-    def write_str(value, stream):
-        if isinstance(value, str):
-            stream.write(value.encode())
-        elif isinstance(value, (bytes, bytearray)):
-            stream.write(value)
-
-    @classmethod
-    def write(cls, value, stream):
-        cls.len_type.write(stream, len(value))
-        cls.write_str(value, stream)
+@encode.register(SimpleType)
+def encode_simple_type(as_type, value):
+    return struct.pack(as_type.format)
 
 
-class ShortStr(BaseStr):
-    len_type = UnsignedChar
+@decode.register(SimpleType)
+def decode_simple_type(as_type, buffer):
+    return struct.unpack(as_type.format)
 
 
-class LongStr(BaseStr):
-    len_type = Long
+@decode.register(ProcessedType)
+def decode_processed_type(as_type, buffer):
+    stream = io.BytesIO(buffer)
+    packed = (read(t, stream) for t in as_type.types)
+    return as_type.unpacker(*packed)
 
 
-class Decimal(AmqpType):
-    @classmethod
-    def read(cls, reader):
-        decimals = UnsignedChar.read(reader)
-        value = SignedLong.read(reader)
-        return Decimal(value) * (Decimal(10) ** -decimals)
-
-    @classmethod
-    def write(cls, value, stream):
-        normalized = value.normalize()
-        if normalized.as_tuple().exponent < 0:
-            decimals = - value.as_tuple().exponent
-            raw = int(value * (bDecimal(10) ** decimals))
-        else:
-            decimals = 0
-            raw = int(normalized)
-        UnsignedChar.write(stream, decimals)
-        SignedLong.write(stream, raw)
+@encode.regiser(ProcessedType)
+def encode_processed_type(as_type, value):
+    return b''.join(
+        encode(type, packed)
+        for type, packed in zip(as_type.types, as_type.packer(value))
+    )
 
 
-class TimeStamp(AmqpType):
-    @classmethod
-    def read(cls, reader):
-        return LongLong.read(reader)
+@read.register(StringType)
+def read_string(as_type, stream):
+    length = read_simple_type(stream, as_type.length_type)
+    return encode(as_type, stream.read(length))
 
-    @classmethod
-    def write(cls, value, stream):
-        LongLong.write(value, stream)
 
-type_to_abbreviation_ = {
-    b't': Bool,
-    b'b': Char,
-    b'B': SignedChar,
-    b'U': SignedShort,
-    b'u': Short,
-    b'I': SignedLong,
-    b'i': Long,
-    b'L': UnsignedLongLong,
-    b'l': LongLong,
-    b'f': Float,
-    b'd': Double,
-    b'D': Decimal,
-    b's': ShortStr,
-    b'S': LongStr,
-    b'A': List,
-    b'T': TimeStamp,
-    b'F': Table,
-}
+@write.register(StringType)
+def write_string(as_type, stream, value):
+    write_simple_type(stream, len(value), as_type.length_type)
+    stream.write(value)
+
+
+def encode_typed(value):
+    amqp_type = py_to_amqp[type(value)]
+    return type_to_abbreviation[amqp_type], encode(amqp_type, value)
+
+
+def read_typed(stream):
+    amqp_type = abbreviation_to_type[chr(read(CHAR, stream))]
+    return read(amqp_type, stream)
+
+
+def encode_key_value(key_value):
+    key, value = key_value
+    return (encode(SHORTSTR, key), ) + encode_typed(value)
+
+
+def read_key_value(stream):
+    return read(SHORTSTR, stream), read_typed(stream)
+
+
+@read.register(Container)
+def read_container(as_type, stream):
+    length = read(LONG, stream)
+    buffer = stream.read(length)
+    return decode(as_type, buffer)
+
+@write.register(Container)
+def write_container(as_type, stream, value):
+    buffer = encode(as_type, value)
+    stream.write(LONG, len(buffer))
+    stream.write(buffer)
+
+
+@decode.register(Container)
+def decode_container(as_type, buffer):
+    data = io.BytesIO(buffer)
+    length = len(buffer)
+    def iter_items():
+        while data.tell() < length:
+            yield as_type.item_reader(data)
+        return as_type.py_type(iter_items)
+    return data.readall()
+
+
+@encode.register(Container)
+def encode_container(as_type, value):
+    return b''.join(
+        chain.from_iterable(
+            map(as_type.item_encode, as_type.iter_items(value))
+        )
+    )
+
 
 type_to_abbreviation = {
-    Bool: 't',
-    Char: 'b',
-    SignedChar: 'B',
-    SignedShort: 'U',
-    Short: 'u',
-    SignedLong: 'I',
-    Long: 'i',
-    UnsignedLongLong: 'L',
-    LongLong: 'l',
-    Float: 'f',
-    Double: 'd',
-    Decimal: 'D',
-    ShortStr: 's',
-    LongStr: 'S',
-    List: 'A',
-    TimeStamp: 'T',
-    Table: 'F',
+    b't': PACKED_BOOLS,
+    b'b': CHAR,
+    b'B': SIGNED_CHAR,
+    b'U': SIGNED_SHORT,
+    b'u': SHORT,
+    b'I': SIGNED_LONG,
+    b'i': LONG,
+    b'L': SIGNED_LONGLONG,
+    b'l': LONGLONG,
+    b'f': FLOAT,
+    b'd': DOUBLE,
+    b'D': Decimal,
+    b's': SHORTSTR,
+    b'S': LONGSTR,
+    b'A': ARRAY,
+    b'T': TIMESTAMP,
+    b'F': TABLE,
+    b'V': NOTHING
 }
+
+abbreviation_to_type = {v: k for k, v in type_to_abbreviation.items()}
 
 py_to_amqp = {
-    bytes: LongStr,
-    str: LongStr,
-    int: Long,
-    dict: Table,
-    bool: Bool,
+    bytes: LONGSTR,
+    str: LONGSTR,
+    int: LONG,
+    dict: TABLE,
+    bool: PACKED_BOOLS,
 }
-
-
-class Container(AmqpType):
-
-    @classmethod
-    def read(cls, reader):
-        length = Long.read(reader)
-        data = io.BytesIO(reader.read(length))
-        def iter_items():
-            while data.tell() < length:
-                yield cls.read_item(data)
-
-        return cls.py_type(iter_items())
-
-    @classmethod
-    def read_item(cls, data):
-        type_key = chr(Char.read(data))
-        if type_key == 'V':
-            return None
-        else:
-            try:
-                return type_to_abbreviation_[type_key].read(data)
-            except KeyError as e:
-                raise ValueError('Uknown value_type {}'.format(type_key))
-
-    @classmethod
-    def write_item(cls, payload, item):
-        payload.write()
-
-class List(AmqpType):
-    py_type = tuple
-
-
-class Table(AmqpType):
-    py_type = dict
-    @classmethod
-    def read_item(cls, data):
-        key = ShortStr.read(data)
-        value = super().read_item(data)
-        return key, value
-
-    @classmethod
-    def write(cls, value, stream):
-
-        def write_with_type(key_value, stream):
-            key, value = key_value
-            amqp_type = py_to_amqp[type(value)]
-            stream.write(type_to_abbreviation[amqp_type])
-            ShortStr.write(key, stream)
-            amqp_type.write(value, stream)
-            return stream
-
-        if value is not None and len(value):
-            payload = io.BytesIO()
-            reduce(write_with_type, value.items(), payload)
-            stream.write(payload.getvalue())
 
 
 class FrameTypes(IntEnum):
@@ -269,16 +229,6 @@ class FrameTypes(IntEnum):
     body = 3
     heartbeat = 8
 
-
-class ComplexStaticSizeType(AmqpType):
-    @classmethod
-    def read(cls, stream):
-        return cls.py_type(*(t.read(stream) for t in cls.types))
-
-    @classmethod
-    def write(cls, value, stream):
-        for t in cls.types:
-            t.write(value, stream)
 
 class Frame(namedtuple('Frame', 'type channel payload frame_end')):
     payload_types = {
@@ -290,9 +240,9 @@ class Frame(namedtuple('Frame', 'type channel payload frame_end')):
 
     @classmethod
     def read(cls, stream):
-        type = Char.read(stream)
-        channel = Short.read(stream)
-        payload_data = io.BytesIO(stream.read(Long.read(stream)))
+        type = CHAR.read(stream)
+        channel = SHORT.read(stream)
+        payload_data = io.BytesIO(stream.read(LONG.read(stream)))
         payload = cls.payload_types[type].read(Frame.payload_data)
         frame_end = stream.readexactly(1)
         if frame_end != aioamqp.constants.FRAME_END:
@@ -306,25 +256,25 @@ class Frame(namedtuple('Frame', 'type channel payload frame_end')):
 
 class MessageProperties(AmqpType):
     field_types = (
-        ShortStr,
-        ShortStr,
-        Table,
-        Char,
-        Char,
-        ShortStr,
-        ShortStr,
-        ShortStr,
-        ShortStr,
-        LongLong,
-        ShortStr,
-        ShortStr,
-        ShortStr,
-        ShortStr,
+        SHORTSTR,
+        SHORTSTR,
+        TABLE,
+        CHAR,
+        CHAR,
+        SHORTSTR,
+        SHORTSTR,
+        SHORTSTR,
+        SHORTSTR,
+        LONGLONG,
+        SHORTSTR,
+        SHORTSTR,
+        SHORTSTR,
+        SHORTSTR,
     )
 
     @classmethod
     def read(cls, stream):
-        flags = Short.read(stream).as_bytes(length=2, byteorder='big')[0:-2]
+        flags = SHORT.read(stream).as_bytes(length=2, byteorder='big')[0:-2]
         return Properties(*(
             type.read(stream) if flag else None
             for flag, type in zip(flags, cls.fields_types)
@@ -333,16 +283,17 @@ class MessageProperties(AmqpType):
     @classmethod
     def write(cls, value, stream):
         assert isinstance(value, Properties) #TODO make error msg
-        def to_bytes(amqp_type, value):
+        def encode(amqp_type, value):
             _ = io.BytesIO()
             amqp_type.write(value, _)
             return _.readall()
         flags, data = zip(*(
-            (0 if property is None else 1, to_bytes(type, property))
+            (0 if property is None else 1, encode(type, property))
             for property, type in zip(value, cls.field_types)
         ))
-        Short.write(int.from_bytes(flags + (0, 0), byteorder='big'))
+        SHORT.write(int.decode(flags + (0, 0), byteorder='big'))
         stream.write(data)
+
 
 Payload = namedtuple('Payload', 'size class_id method_id')
 MethodPayload = namedtuple('MethodPayload', Payload._fields)
@@ -355,11 +306,11 @@ HeaderPayload = namedtuple(
 )
 
 class PayloadT(ComplexStaticSizeType):
-    types = (Long, Short, Short)
+    types = (LONG, SHORT, SHORT)
 
 class MethodPayloadT(PayloadT):
     py_type = MethodPayload
 
 class HeaderPayloadT(PayloadT):
     py_type = HeaderPayload
-    types = PayloadT + (Short, LongLong, MessageProperties)
+    types = PayloadT + (SHORT, LONGLONG, MessageProperties)
